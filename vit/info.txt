@@ -1,0 +1,155 @@
+General summary for the ViT folder
+==================================
+
+This part of the repo is focused on a small Vision Transformer (ViT) autoencoder workflow for BetaSeg 2D image patches.
+The overall idea is:
+
+1. Train a ViT-based autoencoder on image patches.
+2. Reuse the learned embeddings from the encoder.
+3. Test whether those embeddings contain useful structure by clustering pixels from a chosen crop.
+
+
+How the files connect
+=====================
+
+Typical flow:
+
+test_image_extractor.py
+    Finds a good crop in a specific slice that contains all target classes.
+
+train.py
+    Trains the ViT autoencoder and saves checkpoints such as best.pt and last.pt.
+
+models_vit.py
+    Defines the model used by training and testing scripts.
+
+model_kmeans_test.py
+    Loads a trained checkpoint, extracts per-pixel embedding features from a crop, runs KMeans, and visualizes how well clusters align with ground-truth classes.
+
+
+File-by-file notes
+==================
+
+models_vit.py
+--------------
+
+Purpose:
+Defines the actual neural network architecture.
+
+Main parts:
+- ViTEncoderOutput: small dataclass used to return tokens, feature_map, and pooled embeddings together.
+- ConvDecoder: transpose-convolution decoder that upsamples encoder features back to image space.
+- ViTAutoencoder: main model class.
+
+What the model does:
+- Splits the input image patch into ViT patches using a Conv2d patch embedding layer.
+- Adds positional embeddings.
+- Runs a Transformer encoder over patch tokens.
+- Reshapes encoded tokens into a spatial feature map.
+- Decodes the feature map back into a reconstructed image patch.
+
+Useful outputs:
+- forward(x): reconstruction of the input patch.
+- extract_embeddings(..., pooling="mean" | "tokens" | "feature_map"):
+  returns either one embedding per patch, all token embeddings, or the spatial feature map.
+
+Why this file matters:
+This is the core model definition shared by both training and embedding analysis scripts.
+
+
+train.py
+--------
+
+Purpose:
+Trains the ViT autoencoder on BetaSeg2D patches.
+
+Main workflow:
+- Parses training arguments.
+- Builds the BetaSeg datamodule from eps_seg.
+- Infers input channel count from a sample batch.
+- Creates a ViTAutoencoder.
+- Trains with MSE reconstruction loss.
+- Evaluates on validation and test loaders each epoch.
+- Saves checkpoints and training history.
+
+Important details:
+- Optimizer: AdamW
+- Loss: mean squared error between reconstructed patch and original patch
+- Saves:
+  - last.pt
+  - best.pt
+  - history.json
+  - test_embeddings_preview.pt
+  - training plots through plotting.training.plot_training_history
+
+What to remember:
+This script is not doing segmentation directly. It is learning a patch representation by reconstruction, then saving a model whose encoder can later be used for embedding extraction.
+
+
+test_image_extractor.py
+-----------------------
+
+Purpose:
+Finds and exports a fixed crop from a chosen image slice, mainly for a controlled qualitative test region.
+
+What it does:
+- Loads one TIFF image slice and its ground-truth label slice.
+- Searches over candidate crop locations.
+- Keeps only crops that contain all required classes.
+- Scores candidates and picks the best one.
+- Saves a preview PNG of the selected crop.
+- Prints the bounding box and class counts.
+
+Important defaults:
+- Dataset key: high_c4
+- Slice index: 626
+- Crop size: 128 x 128
+- Patch-size margin check is used so the crop stays valid for later patch extraction.
+
+Why this file matters:
+It helps choose a stable evaluation crop that can later be reused in the clustering/embedding test.
+
+
+model_kmeans_test.py
+--------------------
+
+Purpose:
+Evaluates a trained ViT autoencoder by clustering per-pixel embeddings inside a selected crop.
+
+High-level idea:
+- Load a trained checkpoint.
+- Rebuild the model from checkpoint settings.
+- Load one image slice and label slice.
+- Extract a patch around each valid pixel center inside the crop.
+- Run the encoder and take the center embedding for each sampled pixel.
+- Cluster those embeddings with KMeans into 4 clusters.
+- Find the best mapping from cluster IDs to semantic classes.
+- Build a prediction map and visualize results.
+
+Important details:
+- Uses the BetaSeg datamodule mainly to get normalization statistics.
+- Can sample every pixel or subsample with pixel_stride and max_pixels.
+- Exports arrays and metadata when export_dir is provided.
+- Saves a visualization figure and can also show it interactively.
+
+Outputs include:
+- clustered predictions over the crop
+- pixel accuracy after best cluster-to-class matching
+- saved figure
+- optional exported numpy arrays and metadata.json
+
+Why this file matters:
+This is a quick representation-quality check. If clustering works reasonably well, the encoder embeddings likely capture useful semantic information even though the model was trained only as an autoencoder.
+
+
+Big picture
+===========
+
+This code is best understood as an embedding-learning experiment:
+
+- models_vit.py defines the encoder-decoder model.
+- train.py teaches the model to reconstruct image patches.
+- test_image_extractor.py chooses a consistent crop for inspection.
+- model_kmeans_test.py asks: "Do embeddings from the trained encoder separate biologically meaningful classes?"
+
+So the folder is less about final segmentation inference and more about learning and probing visual representations from BetaSeg data.
