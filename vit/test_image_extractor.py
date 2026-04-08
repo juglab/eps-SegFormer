@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import tifffile as tiff
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from config.app_config import (
+    TEST_IMAGE_EXTRACTOR_DEFAULT_DATA_DIR,
+    TEST_IMAGE_EXTRACTOR_DEFAULT_EXPORT_DIR,
+    test_image_extractor_default_output,
+)
+from label_utils import remap_label_array
 from plotting.common import append_timestamp
 
-DEFAULT_DATA_DIR = Path('/group/jug/Sheida/pancreatic beta cells/download/')
 DEFAULT_KEY = 'high_c4'
 DEFAULT_SLICE_INDEX = 626
 DEFAULT_CROP_HEIGHT = 128
@@ -17,8 +27,8 @@ DEFAULT_CROP_WIDTH = 128
 DEFAULT_SEARCH_STRIDE = 8
 DEFAULT_PATCH_SIZE = 32
 DEFAULT_CLASSES = (0, 1, 2, 3)
-DEFAULT_EXPORT_DIR = Path('runs/vit_ae/high_c4_slice626_exports')
-DEFAULT_OUTPUT = DEFAULT_EXPORT_DIR / 'high_c4_slice626_crop.png'
+DEFAULT_EXPORT_DIR = TEST_IMAGE_EXTRACTOR_DEFAULT_EXPORT_DIR
+DEFAULT_OUTPUT = test_image_extractor_default_output(DEFAULT_KEY, DEFAULT_SLICE_INDEX)
 
 
 def default_crop_png_path(key: str = DEFAULT_KEY, slice_index: int = DEFAULT_SLICE_INDEX, export_dir: Path = DEFAULT_EXPORT_DIR) -> Path:
@@ -29,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Find a fixed crop on high_c4 slice 626 that contains all four classes.'
     )
-    parser.add_argument('--data-dir', type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument('--data-dir', type=Path, default=TEST_IMAGE_EXTRACTOR_DEFAULT_DATA_DIR)
     parser.add_argument('--key', default=DEFAULT_KEY)
     parser.add_argument('--slice-index', type=int, default=DEFAULT_SLICE_INDEX)
     parser.add_argument('--crop-height', type=int, default=DEFAULT_CROP_HEIGHT)
@@ -44,7 +54,7 @@ def load_image_and_label_slice(data_dir: Path, key: str, slice_index: int) -> tu
     image_path = data_dir / key / f'{key}_source.tif'
     label_path = data_dir / key / f'{key}_gt.tif'
     image_slice = tiff.imread(image_path)[slice_index].astype(np.float32)
-    label_slice = tiff.imread(label_path)[slice_index].astype(np.int64)
+    label_slice = remap_label_array(tiff.imread(label_path)[slice_index].astype(np.int64))
     return image_slice, label_slice
 
 

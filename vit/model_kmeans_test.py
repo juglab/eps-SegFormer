@@ -19,34 +19,46 @@ from eps_seg.config.train import TrainConfig
 from eps_seg.dataloaders.datamodules import EPSSegDataModule
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(REPO_ROOT / 'vit') not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / 'vit'))
 
+from config.app_config import (
+    MODEL_KMEANS_DEFAULT_CACHE_ROOT,
+    MODEL_KMEANS_DEFAULT_DATA_DIR,
+    MODEL_KMEANS_DEFAULT_MODEL_PATH,
+    model_kmeans_output_dir,
+)
+from label_utils import remap_label_array
 from models_vit import ViTAutoencoder
 from plotting.common import append_timestamp
 from plotting.testing import build_kmeans_figure
 from test_image_extractor import (
     DEFAULT_CROP_HEIGHT,
     DEFAULT_CROP_WIDTH,
-    DEFAULT_DATA_DIR,
     DEFAULT_KEY,
     DEFAULT_SLICE_INDEX,
 )
 
-DEFAULT_CACHE_ROOT = Path('/group/jug/Sheida/Experiments/datasets/cache/segformer_erfan/')
-DEFAULT_CHECKPOINT = REPO_ROOT / 'runs' / 'vit_ae' / 'best.pt'
 DEFAULT_CROP_Y0 = 168
 DEFAULT_CROP_X0 = 600
-DEFAULT_IMAGE_OUTPUT_DIRNAME = 'kmeans_test_images'
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Run KMeans on per-pixel ViT embeddings for the fixed test crop.'
     )
-    parser.add_argument('--data-dir', type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument('--cache-root', type=Path, default=DEFAULT_CACHE_ROOT)
-    parser.add_argument('--checkpoint', type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument('--data-dir', type=Path, default=MODEL_KMEANS_DEFAULT_DATA_DIR)
+    parser.add_argument('--cache-root', type=Path, default=MODEL_KMEANS_DEFAULT_CACHE_ROOT)
+    parser.add_argument(
+        '--model-path',
+        '--checkpoint',
+        dest='model_path',
+        type=Path,
+        default=MODEL_KMEANS_DEFAULT_MODEL_PATH,
+        help='Path to a training run directory or a checkpoint file such as best.pt/last.pt.',
+    )
     parser.add_argument('--key', default=DEFAULT_KEY)
     parser.add_argument('--slice-index', type=int, default=DEFAULT_SLICE_INDEX)
     parser.add_argument('--crop-y0', type=int, default=DEFAULT_CROP_Y0)
@@ -101,6 +113,29 @@ def load_checkpoint_bundle(checkpoint_path: Path) -> dict[str, object]:
     return torch.load(checkpoint_path, map_location='cpu')
 
 
+def resolve_checkpoint_path(model_path: Path) -> Path:
+    if model_path.is_file():
+        return model_path
+
+    if model_path.is_dir():
+        for checkpoint_name in ('best.pt', 'last.pt'):
+            checkpoint_path = model_path / checkpoint_name
+            if checkpoint_path.exists():
+                return checkpoint_path
+        raise FileNotFoundError(
+            f'No checkpoint file found in model directory: {model_path}. '
+            'Expected best.pt or last.pt.'
+        )
+
+    if model_path.suffix == '.pt':
+        raise FileNotFoundError(f'Missing checkpoint file: {model_path}')
+
+    if model_path.exists():
+        raise FileNotFoundError(f'Unsupported model path: {model_path}')
+
+    raise FileNotFoundError(f'Missing model path: {model_path}')
+
+
 def infer_depth(state_dict: dict[str, torch.Tensor]) -> int:
     return len({int(key.split('.')[2]) for key in state_dict if key.startswith('encoder.layers.')})
 
@@ -121,12 +156,14 @@ def load_model(checkpoint: dict[str, object], device: torch.device) -> ViTAutoen
         patch_size=model_config['patch_size'],
         in_channels=model_config['in_channels'],
         embed_dim=model_config['embed_dim'],
+        token_embed_dim=model_config.get('token_embed_dim', model_config['embed_dim']),
         depth=depth,
         num_heads=num_heads,
         mlp_ratio=mlp_ratio,
         dropout=dropout,
+        num_classes=int(model_config.get('num_classes', 4)),
     )
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     model.to(device)
     return model
@@ -136,7 +173,7 @@ def load_slice_arrays(data_dir: Path, key: str, z_index: int) -> tuple[np.ndarra
     image_path = data_dir / key / f'{key}_source.tif'
     label_path = data_dir / key / f'{key}_gt.tif'
     image_volume = tiff.imread(image_path).astype(np.float32)
-    label_volume = tiff.imread(label_path).astype(np.int64)
+    label_volume = remap_label_array(tiff.imread(label_path).astype(np.int64))
     return image_volume[z_index], label_volume[z_index]
 
 
@@ -341,7 +378,7 @@ def build_image_filename(args: argparse.Namespace, checkpoint: dict[str, object]
 def resolve_output_path(args: argparse.Namespace, checkpoint_path: Path, checkpoint: dict[str, object], crop_bbox: tuple[int, int, int, int]) -> Path:
     if args.output is not None:
         return append_timestamp(args.output)
-    output_dir = checkpoint_path.parent / DEFAULT_IMAGE_OUTPUT_DIRNAME
+    output_dir = model_kmeans_output_dir(checkpoint_path.parent)
     filename = build_image_filename(args, checkpoint, crop_bbox)
     return append_timestamp(output_dir / filename)
 
@@ -359,7 +396,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     datamodule = build_datamodule(args)
     data_mean, data_std = datamodule.get_data_statistics()
 
-    checkpoint = load_checkpoint_bundle(args.checkpoint)
+    checkpoint_path = resolve_checkpoint_path(args.model_path)
+    checkpoint = load_checkpoint_bundle(checkpoint_path)
     model = load_model(checkpoint, device=device)
     image_slice, label_slice = load_slice_arrays(args.data_dir, args.key, args.slice_index)
     image_slice_norm = (image_slice - float(data_mean)) / float(data_std)
@@ -389,9 +427,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     y0, y1, x0, x1 = crop_bbox
     image_crop = image_slice[y0:y1, x0:x1]
     fig = build_kmeans_figure(image_crop, prediction_map, crop_gt, args.key, args.slice_index, crop_bbox)
-    output_path = resolve_output_path(args, args.checkpoint, checkpoint, crop_bbox)
+    output_path = resolve_output_path(args, checkpoint_path, checkpoint, crop_bbox)
 
     return {
+        'checkpoint_path': checkpoint_path,
         'checkpoint': checkpoint,
         'crop_bbox': crop_bbox,
         'image_crop': image_crop,
@@ -414,12 +453,11 @@ def main() -> None:
     args = parse_args()
     if not args.data_dir.exists():
         raise FileNotFoundError(f'Missing data directory: {args.data_dir}')
-    if not args.checkpoint.exists():
-        raise FileNotFoundError(f'Missing checkpoint: {args.checkpoint}')
 
     result = run_experiment(args)
     crop_bbox = result['crop_bbox']
 
+    print('checkpoint path :', result['checkpoint_path'])
     print('slice shape     :', result['slice_shape'])
     print('crop bbox       :', crop_bbox)
     print('crop y-range    :', (crop_bbox[0], crop_bbox[1] - 1))
