@@ -162,6 +162,9 @@ def load_model(checkpoint: dict[str, object], device: torch.device) -> ViTAutoen
         mlp_ratio=mlp_ratio,
         dropout=dropout,
         num_classes=int(model_config.get('num_classes', 4)),
+        segmentation_head=str(model_config.get('segmentation_head', 'linear')),
+        classifier_context_kernel_size=int(model_config.get('classifier_context_kernel_size', 1)),
+        classifier_hidden_dim=model_config.get('classifier_hidden_dim'),
     )
     model.load_state_dict(state_dict, strict=False)
     model.eval()
