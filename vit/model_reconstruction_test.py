@@ -30,6 +30,7 @@ from model_kmeans_test import (
 )
 from plotting.common import append_timestamp
 from plotting.testing import build_reconstruction_figure
+from reproducibility import configure_reproducibility
 from test_image_extractor import (
     DEFAULT_CROP_HEIGHT,
     DEFAULT_CROP_WIDTH,
@@ -39,6 +40,7 @@ from test_image_extractor import (
     DEFAULT_SLICE_INDEX,
     find_best_crop,
 )
+from wild_west_dataloader import build_level_bboxes, sample_bbox_from_slice
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,16 +135,44 @@ def reconstruct_region(
     ]
     for start in tqdm(range(0, len(tile_coords), batch_size), desc='Reconstructing tiles'):
         batch_coords = tile_coords[start:start + batch_size]
-        patches = [
-            image_slice_norm[
-                global_y:global_y + tile_size,
-                global_x:global_x + tile_size,
+        if hasattr(model, 'num_levels'):
+            resolution_scales = getattr(model, 'resolution_scales', (1.0,))
+            image_levels = []
+            bboxes = []
+            half = tile_size // 2
+            for _, _, global_y, global_x in batch_coords:
+                bbox = build_level_bboxes(
+                    global_y + half,
+                    global_x + half,
+                    patch_size=tile_size,
+                    resolution_scales=resolution_scales,
+                )
+                bboxes.append(bbox)
+                image_levels.append(
+                    torch.stack(
+                        [
+                            sample_bbox_from_slice(image_slice_norm, level_bbox, out_size=tile_size, mode='bilinear')
+                            for level_bbox in bbox
+                        ],
+                        dim=0,
+                    )
+                )
+            batch_tensor = torch.stack(image_levels, dim=0).to(device=device, dtype=torch.float32)
+            bbox_tensor = torch.stack(bboxes, dim=0).to(device=device, dtype=torch.float32)
+        else:
+            patches = [
+                image_slice_norm[
+                    global_y:global_y + tile_size,
+                    global_x:global_x + tile_size,
+                ]
+                for _, _, global_y, global_x in batch_coords
             ]
-            for _, _, global_y, global_x in batch_coords
-        ]
-        batch_tensor = torch.from_numpy(np.stack(patches)).unsqueeze(1).to(device=device, dtype=torch.float32)
+            batch_tensor = torch.from_numpy(np.stack(patches)).unsqueeze(1).to(device=device, dtype=torch.float32)
         with torch.inference_mode():
-            aux = model.forward_with_aux(batch_tensor, mask_ratio=0.0)
+            if hasattr(model, 'num_levels'):
+                aux = model.forward_with_aux(batch_tensor, bbox=bbox_tensor, mask_ratio=0.0)
+            else:
+                aux = model.forward_with_aux(batch_tensor, mask_ratio=0.0)
             reconstructed_batch = aux.reconstruction[:, 0].cpu().numpy().astype(np.float32)
         reconstructed_batch = reconstructed_batch * float(data_std) + float(data_mean)
 
@@ -179,8 +209,7 @@ def build_output_path(output: Path | None, checkpoint_path: Path, key: str, slic
 
 
 def run_experiment(args: argparse.Namespace) -> dict[str, object]:
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    configure_reproducibility(args.seed)
 
     device = torch.device(args.device)
     datamodule = build_datamodule(args)

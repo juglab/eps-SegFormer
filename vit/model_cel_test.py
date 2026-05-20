@@ -42,6 +42,7 @@ from plotting.testing import (
     build_direct_segmentation_figure,
     build_reconstruction_figure,
 )
+from reproducibility import configure_reproducibility
 from test_image_extractor import (
     DEFAULT_CROP_HEIGHT,
     DEFAULT_CROP_WIDTH,
@@ -52,6 +53,7 @@ from test_image_extractor import (
     find_best_crop,
 )
 from train import load_wandb_settings
+from wild_west_dataloader import build_level_bboxes, sample_bbox_from_slice
 
 
 def parse_args() -> argparse.Namespace:
@@ -218,6 +220,44 @@ def classify_patch_batch(model, batch_tensor: torch.Tensor) -> tuple[np.ndarray,
     )
 
 
+def classify_muvit_patch_batch(
+    model,
+    image_slice_norm: np.ndarray,
+    batch_coords: list[tuple[int, int, int, int]],
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    resolution_scales = getattr(model, 'resolution_scales', (1.0,))
+    image_levels = []
+    bboxes = []
+    for _local_y, _local_x, global_y, global_x in batch_coords:
+        bbox = build_level_bboxes(
+            global_y,
+            global_x,
+            patch_size=model.image_size,
+            resolution_scales=resolution_scales,
+        )
+        bboxes.append(bbox)
+        image_levels.append(
+            torch.stack(
+                [
+                    sample_bbox_from_slice(image_slice_norm, level_bbox, out_size=model.image_size, mode='bilinear')
+                    for level_bbox in bbox
+                ],
+                dim=0,
+            )
+        )
+
+    batch_tensor = torch.stack(image_levels, dim=0).to(device=device, dtype=torch.float32)
+    bbox_tensor = torch.stack(bboxes, dim=0).to(device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        aux = model.forward_with_aux(batch_tensor, bbox=bbox_tensor, mask_ratio=0.0)
+    predictions, probabilities = classify_center_token_logits(aux.token_logits, grid_size=model.grid_size)
+    return (
+        predictions.cpu().numpy().astype(np.int64),
+        probabilities.cpu().numpy().astype(np.float32),
+    )
+
+
 def build_eval_bbox(
     args: argparse.Namespace,
     label_slice: np.ndarray,
@@ -305,16 +345,25 @@ def predict_crop_pixels(
         batch_coords = valid_coords[start:start + batch_size]
         patches = []
         for local_y, local_x, global_y, global_x in batch_coords:
-            patch = image_slice_norm[
-                global_y - half:global_y - half + model.image_size,
-                global_x - half:global_x - half + model.image_size,
-            ]
-            patches.append(patch)
+            if not hasattr(model, 'num_levels'):
+                patch = image_slice_norm[
+                    global_y - half:global_y - half + model.image_size,
+                    global_x - half:global_x - half + model.image_size,
+                ]
+                patches.append(patch)
             class_targets.append(int(label_slice[global_y, global_x]))
             local_positions.append((local_y, local_x))
 
-        batch_tensor = torch.from_numpy(np.stack(patches)).unsqueeze(1).to(device=device, dtype=torch.float32)
-        predictions, probabilities = classify_patch_batch(model, batch_tensor)
+        if hasattr(model, 'num_levels'):
+            predictions, probabilities = classify_muvit_patch_batch(
+                model,
+                image_slice_norm=image_slice_norm,
+                batch_coords=batch_coords,
+                device=device,
+            )
+        else:
+            batch_tensor = torch.from_numpy(np.stack(patches)).unsqueeze(1).to(device=device, dtype=torch.float32)
+            predictions, probabilities = classify_patch_batch(model, batch_tensor)
         class_probabilities.append(probabilities)
         class_predictions.append(predictions)
 
@@ -706,8 +755,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     if args.max_pixels is not None and args.max_pixels < 1:
         raise ValueError('--max-pixels must be >= 1 when provided')
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    configure_reproducibility(args.seed)
 
     device = torch.device(args.device)
     checkpoint_path = resolve_checkpoint_path(args.model_path)

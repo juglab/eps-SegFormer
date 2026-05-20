@@ -196,6 +196,7 @@ class ViTAutoencoder(nn.Module):
         segmentation_head: str = "linear",
         classifier_context_kernel_size: int = 1,
         classifier_hidden_dim: int | None = None,
+        masking_mode: str = "token",
     ) -> None:
         super().__init__()
         if image_size % patch_size != 0:
@@ -204,6 +205,8 @@ class ViTAutoencoder(nn.Module):
             raise ValueError("token_embed_dim must match embed_dim when zero padding is disabled")
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
+        if masking_mode not in ("token", "drop"):
+            raise ValueError("masking_mode must be one of 'token' or 'drop'.")
 
         self.image_size = image_size
         self.patch_size = patch_size
@@ -215,6 +218,7 @@ class ViTAutoencoder(nn.Module):
         self.segmentation_head = segmentation_head
         self.classifier_context_kernel_size = classifier_context_kernel_size
         self.classifier_hidden_dim = classifier_hidden_dim
+        self.masking_mode = masking_mode
         self.grid_size = image_size // patch_size
         self.num_patches = self.grid_size * self.grid_size
 
@@ -317,13 +321,59 @@ class ViTAutoencoder(nn.Module):
         visible_mask.scatter_(1, mask_indices, False)
         return masked, visible_mask
 
+    def _encode_masked_tokens(
+        self,
+        tokens: torch.Tensor,
+        visible_mask: torch.Tensor,
+        masking_mode: str | None = None,
+    ) -> torch.Tensor:
+        mode = self.masking_mode if masking_mode is None else masking_mode
+        if mode == "token":
+            tokens = self.pos_dropout(tokens + self.pos_embed_scale * self.pos_embed)
+            tokens = self.encoder(tokens)
+            return self.encoder_norm(tokens)
+        if mode != "drop":
+            raise ValueError("masking_mode must be one of 'token' or 'drop'.")
+
+        batch_size, num_tokens, embed_dim = tokens.shape
+        visible_counts = visible_mask.sum(dim=1)
+        if (visible_counts == 0).any():
+            raise ValueError("drop masking requires at least one visible token per sample.")
+
+        max_visible = int(visible_counts.max().item())
+        visible_inputs = tokens.new_zeros((batch_size, max_visible, embed_dim))
+        padding_mask = torch.ones(
+            batch_size,
+            max_visible,
+            device=tokens.device,
+            dtype=torch.bool,
+        )
+
+        positioned_tokens = tokens + self.pos_embed_scale * self.pos_embed
+        for batch_index in range(batch_size):
+            count = int(visible_counts[batch_index].item())
+            visible_inputs[batch_index, :count] = positioned_tokens[batch_index, visible_mask[batch_index]]
+            padding_mask[batch_index, :count] = False
+
+        visible_inputs = self.pos_dropout(visible_inputs)
+        encoder_padding_mask = padding_mask if padding_mask.any() else None
+        encoded_visible = self.encoder(
+            visible_inputs,
+            src_key_padding_mask=encoder_padding_mask,
+        )
+        encoded_visible = self.encoder_norm(encoded_visible)
+
+        encoded_full = self.mask_token.expand(batch_size, num_tokens, -1).clone()
+        for batch_index in range(batch_size):
+            count = int(visible_counts[batch_index].item())
+            encoded_full[batch_index, visible_mask[batch_index]] = encoded_visible[batch_index, :count]
+        return encoded_full
+
     def encode(self, x: torch.Tensor, mask_ratio: float = 0.0) -> ViTEncoderOutput:
         tokens = self.patch_embed(x)
         tokens = tokens.flatten(2).transpose(1, 2)
         tokens, visible_mask = self._apply_random_mask(tokens, mask_ratio=mask_ratio)
-        tokens = self.pos_dropout(tokens + self.pos_embed_scale * self.pos_embed)
-        tokens = self.encoder(tokens)
-        tokens = self.encoder_norm(tokens)
+        tokens = self._encode_masked_tokens(tokens, visible_mask)
         feature_map = tokens.transpose(1, 2).reshape(
             x.shape[0], self.embed_dim, self.grid_size, self.grid_size
         )

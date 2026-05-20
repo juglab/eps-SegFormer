@@ -29,6 +29,7 @@ from dataloader import build_train_val_loaders
 from label_utils import remap_label_tensor, valid_class_mask
 from models_vit import ViTAutoencoder
 from plotting.training import plot_training_history
+from reproducibility import configure_reproducibility
 
 DEFAULT_WANDB_SETTINGS: dict[str, object] = {
     "entity": "juglab",
@@ -61,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--max-folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Seed Python/NumPy/PyTorch and prefer deterministic PyTorch/cuDNN algorithms.",
+    )
     parser.add_argument("--patch-size", type=int, default=25, help="BetaSeg2D patch size returned by the dataloader.")
     parser.add_argument("--vit-patch-size", type=int, default=5, help="Patch size used inside the ViT encoder.")
     parser.add_argument("--batch-size", type=int, default=256)
@@ -73,6 +80,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=14)
     parser.add_argument("--num-heads", type=int, default=1)
     parser.add_argument("--mask-ratio", type=float, default=0.00)
+    parser.add_argument(
+        "--masking-mode",
+        choices=("token", "drop"),
+        default="token",
+        help="How masked patches are handled: token keeps learned mask tokens in the encoder, drop excludes masked patches from the encoder.",
+    )
     parser.add_argument("--cls-loss-weight", type=float, default=1.0)
     parser.add_argument(
         "--loss-mode",
@@ -125,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-tags", nargs="*", default=None, help="Optional Weights & Biases tags.")
     parser.add_argument("--self-test", action="store_true", help="Run lightweight loss/shape self-tests and exit.")
     args = parser.parse_args()
+    args.auto_run_name = args.run_name is None and args.legacy_run_name is None
     if args.run_name is None:
         args.run_name = args.legacy_run_name
     return args
@@ -139,6 +153,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, tup
         num_workers=args.num_workers,
         train_coords_csv=args.train_coords_csv,
         val_coords_csv=args.val_coords_csv,
+        seed=args.seed,
     )
 
 
@@ -358,6 +373,22 @@ def run_masking_self_tests() -> None:
     assert not torch.allclose(masked_token_inputs, torch.zeros_like(masked_token_inputs))
     assert not torch.allclose(masked_token_inputs[0], masked_token_inputs[1])
 
+    captured_encoder_inputs: list[torch.Tensor] = []
+
+    def capture_encoder_input(_, inputs):
+        captured_encoder_inputs.append(inputs[0].detach().clone())
+
+    handle = model.encoder.register_forward_pre_hook(capture_encoder_input)
+    encoded = model._encode_masked_tokens(masked, visible_mask, masking_mode="drop")
+    handle.remove()
+
+    visible_positions = visible_mask[0].nonzero(as_tuple=False).flatten()
+    expected_visible_inputs = token_inputs[0, visible_positions]
+    assert captured_encoder_inputs[-1].shape[1] == visible_positions.numel()
+    assert torch.allclose(captured_encoder_inputs[-1][0], expected_visible_inputs)
+    assert encoded.shape == tokens.shape
+    assert torch.allclose(encoded[0, masked_positions], model.mask_token[0].expand(masked_positions.numel(), -1))
+
 
 def run_epoch(
     model: nn.Module,
@@ -454,6 +485,7 @@ def build_training_config(args: argparse.Namespace) -> dict[str, object]:
         "depth": args.depth,
         "num_heads": args.num_heads,
         "mask_ratio": args.mask_ratio,
+        "masking_mode": args.masking_mode,
         "cls_loss_weight": args.cls_loss_weight,
         "loss_mode": args.loss_mode,
         "mlp_ratio": args.mlp_ratio,
@@ -471,7 +503,11 @@ def build_training_config(args: argparse.Namespace) -> dict[str, object]:
 
 
 def resolve_run_output_dir(args: argparse.Namespace) -> tuple[str, Path]:
-    run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if getattr(args, "auto_run_name", args.run_name is None):
+        masking_mode = getattr(args, "masking_mode", "token")
+        run_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_mask-{masking_mode}"
+    else:
+        run_name = args.run_name
     return run_name, args.output_dir / run_name
 
 
@@ -571,6 +607,7 @@ def save_checkpoint(
             "embed_dim": model.embed_dim,
             "token_embed_dim": model.token_embed_dim,
             "num_classes": model.num_classes,
+            "masking_mode": model.masking_mode,
             "segmentation_head": model.segmentation_head,
             "classifier_context_kernel_size": model.classifier_context_kernel_size,
             "classifier_hidden_dim": model.classifier_hidden_dim,
@@ -608,7 +645,7 @@ def main() -> None:
         return
     if args.data_dir == TRAIN_DEFAULT_DATA_DIR:
         args.data_dir = args.dataset_root / "datasets" / "betaseg"
-    torch.manual_seed(args.seed)
+    configure_reproducibility(args.seed, deterministic=args.deterministic)
     run_name, run_output_dir = resolve_run_output_dir(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_output_dir.mkdir(parents=True, exist_ok=True)
@@ -640,6 +677,7 @@ def main() -> None:
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
+        masking_mode=args.masking_mode,
         segmentation_head=args.segmentation_head,
         classifier_context_kernel_size=args.classifier_context_kernel_size,
         classifier_hidden_dim=args.classifier_hidden_dim,

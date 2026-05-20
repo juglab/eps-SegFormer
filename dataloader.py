@@ -11,6 +11,8 @@ import tifffile as tiff
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from reproducibility import make_torch_generator, seed_worker
+
 
 EXPECTED_COLUMNS = ("name", "z", "y", "x")
 DATASETS_RELATIVE_DIR = Path("datasets") / "betaseg"
@@ -268,6 +270,7 @@ def build_split_dataloader(
     normalize_std: float | None,
     shuffle: bool,
     csv_path: Path | None = None,
+    seed: int = 42,
 ) -> DataLoader:
     dataset = BetaSegCoordDataset(
         dataset_root=dataset_root,
@@ -285,6 +288,8 @@ def build_split_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(seed),
     )
 
 
@@ -296,6 +301,7 @@ def build_train_val_loaders(
     num_workers: int,
     train_coords_csv: Path | None = None,
     val_coords_csv: Path | None = None,
+    seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, tuple[float, float]]:
     train_csv_path = train_coords_csv or _csv_path_for_split(dataset_root, size=dataset_size, split="train")
     val_csv_path = val_coords_csv or _csv_path_for_split(dataset_root, size=dataset_size, split="val")
@@ -330,6 +336,8 @@ def build_train_val_loaders(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(seed),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -338,5 +346,7 @@ def build_train_val_loaders(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(seed + 1),
     )
     return train_loader, val_loader, (train_mean, train_std)
