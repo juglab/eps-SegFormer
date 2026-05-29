@@ -93,6 +93,18 @@ def parse_args() -> argparse.Namespace:
         default="ce_reconstruct_all",
         help="Reconstruction term combined with visible-token cross-entropy.",
     )
+    parser.add_argument(
+        "--normalize-patches",
+        action="store_true",
+        default=False,
+        help="Normalize each patch token to zero mean and unit variance before MSE loss (MAE-style).",
+    )
+    parser.add_argument(
+        "--fft-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for FFT frequency-domain L1 loss added to MSE. 0.0 = disabled. MuViT uses 0.01.",
+    )
     parser.add_argument("--mlp-ratio", type=float, default=2.0)
     parser.add_argument("--dropout", type=float, default=0.0)
 
@@ -257,34 +269,91 @@ def expand_visible_mask_to_pixels(
     return pixel_mask.unsqueeze(1)
 
 
-def compute_reconstruction_loss(
+def normalize_patch_tokens(patches: torch.Tensor, vit_patch_size: int, eps: float = 1e-6) -> torch.Tensor:
+    B, C, H, W = patches.shape
+    p = vit_patch_size
+    grid_h, grid_w = H // p, W // p
+    x = patches.reshape(B, C, grid_h, p, grid_w, p)
+    x = x.permute(0, 2, 4, 1, 3, 5).reshape(B, grid_h * grid_w, C * p * p)
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True)
+    x = (x - mean) / (std + eps)
+    x = x.reshape(B, grid_h, grid_w, C, p, p)
+    return x.permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
+
+
+def compute_fft_loss(
     reconstruction: torch.Tensor,
     patches: torch.Tensor,
     visible_mask: torch.Tensor,
     vit_patch_size: int,
     loss_mode: str,
 ) -> torch.Tensor:
+    B, C, H, W = patches.shape
+    p = vit_patch_size
+    gh, gw = H // p, W // p
+    num_tokens = gh * gw
+
+    def to_tokens(t: torch.Tensor) -> torch.Tensor:
+        return t.reshape(B, C, gh, p, gw, p).permute(0, 2, 4, 1, 3, 5).reshape(B, num_tokens, C, p, p)
+
+    recon_t = to_tokens(reconstruction)
+    patch_t = to_tokens(patches)
+
     if loss_mode == "ce_reconstruct_all":
-        return F.mse_loss(reconstruction, patches)
-
-    pixel_visible_mask = expand_visible_mask_to_pixels(
-        visible_mask,
-        vit_patch_size=vit_patch_size,
-        image_shape=(patches.shape[-2], patches.shape[-1]),
-    )
-    if loss_mode == "ce_inpaint":
-        selected = ~pixel_visible_mask
-    elif loss_mode == "ce_reconstruct_visible":
-        selected = pixel_visible_mask
+        sel = torch.ones(B, num_tokens, dtype=torch.bool, device=patches.device)
+    elif loss_mode == "ce_inpaint":
+        sel = ~visible_mask
     else:
-        raise ValueError(f"Unsupported loss_mode '{loss_mode}'. Use one of {LOSS_MODES}.")
+        sel = visible_mask
 
-    selected = selected.expand_as(reconstruction)
-    if not selected.any():
+    recon_sel = recon_t[sel]
+    patch_sel = patch_t[sel]
+    if recon_sel.numel() == 0:
         return reconstruction.new_zeros(())
 
-    squared_error = (reconstruction - patches).pow(2)
-    return squared_error.masked_select(selected).mean()
+    recon_f = torch.fft.rfft2(recon_sel.to(torch.float32))
+    patch_f = torch.fft.rfft2(patch_sel.to(torch.float32))
+    return F.l1_loss(recon_f, patch_f)
+
+
+def compute_reconstruction_loss(
+    reconstruction: torch.Tensor,
+    patches: torch.Tensor,
+    visible_mask: torch.Tensor,
+    vit_patch_size: int,
+    loss_mode: str,
+    normalize_patches: bool = False,
+    fft_loss_weight: float = 0.0,
+) -> torch.Tensor:
+    if normalize_patches:
+        patches = normalize_patch_tokens(patches, vit_patch_size)
+    if loss_mode == "ce_reconstruct_all":
+        mse = F.mse_loss(reconstruction, patches)
+    else:
+        pixel_visible_mask = expand_visible_mask_to_pixels(
+            visible_mask,
+            vit_patch_size=vit_patch_size,
+            image_shape=(patches.shape[-2], patches.shape[-1]),
+        )
+        if loss_mode == "ce_inpaint":
+            selected = ~pixel_visible_mask
+        elif loss_mode == "ce_reconstruct_visible":
+            selected = pixel_visible_mask
+        else:
+            raise ValueError(f"Unsupported loss_mode '{loss_mode}'. Use one of {LOSS_MODES}.")
+
+        selected = selected.expand_as(reconstruction)
+        if not selected.any():
+            return reconstruction.new_zeros(())
+
+        squared_error = (reconstruction - patches).pow(2)
+        mse = squared_error.masked_select(selected).mean()
+
+    if fft_loss_weight > 0.0:
+        fft = compute_fft_loss(reconstruction, patches, visible_mask, vit_patch_size, loss_mode)
+        return mse + fft_loss_weight * fft
+    return mse
 
 
 def run_loss_mode_self_tests() -> None:
@@ -398,6 +467,8 @@ def run_epoch(
     mask_ratio: float = 0.0,
     cls_loss_weight: float = 1.0,
     loss_mode: str = "ce_reconstruct_all",
+    normalize_patches: bool = False,
+    fft_loss_weight: float = 0.0,
     optimizer: AdamW | None = None,
     stage_name: str = "eval",
     epoch: int | None = None,
@@ -432,6 +503,8 @@ def run_epoch(
                 visible_mask=aux.visible_mask,
                 vit_patch_size=vit_patch_size,
                 loss_mode=loss_mode,
+                normalize_patches=normalize_patches,
+                fft_loss_weight=fft_loss_weight,
             )
             token_targets = extract_token_center_targets(segments, vit_patch_size=vit_patch_size)
             ce_loss, cls_acc, supervised_tokens = compute_center_classification_metrics(
@@ -702,6 +775,8 @@ def main() -> None:
             mask_ratio=args.mask_ratio,
             cls_loss_weight=args.cls_loss_weight,
             loss_mode=args.loss_mode,
+            normalize_patches=args.normalize_patches,
+            fft_loss_weight=args.fft_loss_weight,
             optimizer=optimizer,
             stage_name="train",
             epoch=epoch,
@@ -715,6 +790,8 @@ def main() -> None:
             mask_ratio=args.mask_ratio,
             cls_loss_weight=args.cls_loss_weight,
             loss_mode=args.loss_mode,
+            normalize_patches=args.normalize_patches,
+            fft_loss_weight=args.fft_loss_weight,
             stage_name="val",
             epoch=epoch,
         )

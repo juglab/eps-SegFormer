@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -69,16 +70,19 @@ class RoPEAttention2D(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.proj_dropout = nn.Dropout(dropout)
 
-        inv_freq = rope_base ** (
-            -torch.arange(0, self.axis_dim, 2, dtype=torch.float32) / self.axis_dim
+        self.log_rope_base = nn.Parameter(torch.tensor(math.log(rope_base)))
+        self.register_buffer(
+            "_freq_exponents",
+            -torch.arange(0, self.axis_dim, 2, dtype=torch.float32) / self.axis_dim,
+            persistent=False,
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _apply_rope(self, x: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        inv_freq = torch.exp(self.log_rope_base * self._freq_exponents.to(dtype=x.dtype))
         y_part, x_part = x[..., : self.axis_dim], x[..., self.axis_dim :]
         norm_coords = coords.to(dtype=x.dtype) / self.coord_scale
-        y_angles = norm_coords[:, None, :, 0, None] * self.inv_freq.to(dtype=x.dtype).view(1, 1, 1, -1)
-        x_angles = norm_coords[:, None, :, 1, None] * self.inv_freq.to(dtype=x.dtype).view(1, 1, 1, -1)
+        y_angles = norm_coords[:, None, :, 0, None] * inv_freq.view(1, 1, 1, -1)
+        x_angles = norm_coords[:, None, :, 1, None] * inv_freq.view(1, 1, 1, -1)
         y_cos = y_angles.cos().repeat_interleave(2, dim=-1)
         y_sin = y_angles.sin().repeat_interleave(2, dim=-1)
         x_cos = x_angles.cos().repeat_interleave(2, dim=-1)
@@ -161,6 +165,7 @@ class WildWestMuViTV2(nn.Module):
         classifier_context_kernel_size: int = 1,
         classifier_hidden_dim: int | None = None,
         masking_mode: str = "token",
+        dirichlet_alpha: float | None = None,
     ) -> None:
         super().__init__()
         if image_size <= 0 or image_size % patch_size != 0:
@@ -185,6 +190,7 @@ class WildWestMuViTV2(nn.Module):
         self.classifier_context_kernel_size = classifier_context_kernel_size
         self.classifier_hidden_dim = classifier_hidden_dim
         self.masking_mode = masking_mode
+        self.dirichlet_alpha = dirichlet_alpha
         self.grid_size = image_size // patch_size
         self.num_patches = self.grid_size * self.grid_size
 
@@ -284,8 +290,16 @@ class WildWestMuViTV2(nn.Module):
                 )
             random_mask_exclusion_mask = random_mask_exclusion_mask.to(device=tokens.device, dtype=torch.bool)
 
-        num_masked_per_level = int(self.num_patches * mask_ratio)
-        if num_masked_per_level <= 0:
+        if self.dirichlet_alpha is not None and mask_ratio > 0.0:
+            weights = torch.distributions.Dirichlet(
+                torch.full((self.num_levels,), self.dirichlet_alpha)
+            ).sample()
+            level_ratios = (weights * self.num_levels * mask_ratio).clamp(0.0, 1.0 - 1e-6)
+            num_masked_per_level = [int(self.num_patches * r.item()) for r in level_ratios]
+        else:
+            num_masked_per_level = [int(self.num_patches * mask_ratio)] * self.num_levels
+
+        if all(n <= 0 for n in num_masked_per_level):
             return masked, visible_mask
 
         noise = torch.rand(batch_size, num_tokens, device=tokens.device)
@@ -303,7 +317,7 @@ class WildWestMuViTV2(nn.Module):
             level_mask_indices = level_noise.argsort(dim=1)
             for batch_index in range(batch_size):
                 available_count = int((~level_unavailable[batch_index]).sum().item())
-                random_mask_count = min(num_masked_per_level, available_count)
+                random_mask_count = min(num_masked_per_level[level_index], available_count)
                 if random_mask_count <= 0:
                     continue
                 selected = level_mask_indices[batch_index, :random_mask_count] + start

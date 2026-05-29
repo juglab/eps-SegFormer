@@ -941,6 +941,169 @@ def build_train_val_multires_loaders(
     return train_loader, val_loader, (train_mean, train_std)
 
 
+class PretrainDataset(Dataset):
+    """Randomly samples patches from full 3D volumes for unsupervised pretraining.
+
+    Unlike BetaSegCoordDataset, this uses no coordinate CSV — coordinates are
+    pre-sampled uniformly at random from all valid positions in the given volumes.
+    All samples are unlabeled (center_label = UNRECOGNIZED_LABEL).
+    """
+
+    def __init__(
+        self,
+        dataset_root: Path,
+        names: list[str],
+        patch_size: int,
+        normalize_mean: float,
+        normalize_std: float,
+        num_samples: int,
+        seed: int = 42,
+    ) -> None:
+        self.patch_size = patch_size
+        self.half = patch_size // 2
+        self.normalize_mean = normalize_mean
+        self.normalize_std = normalize_std
+        self.num_samples = num_samples
+
+        self.source_paths: dict[str, Path] = {}
+        self.volume_shapes: dict[str, tuple[int, int, int]] = {}
+        for name in names:
+            source_path, _ = _resolve_volume_paths(dataset_root, name)
+            self.source_paths[name] = source_path
+            self.volume_shapes[name] = _volume_shape(source_path)
+
+        self.coords = self._sample_coords(names, seed)
+
+    def _sample_coords(self, names: list[str], seed: int) -> list[tuple[str, int, int, int]]:
+        rng = np.random.default_rng(seed)
+        coords = []
+        for _ in range(self.num_samples):
+            name = names[rng.integers(len(names))]
+            depth, height, width = self.volume_shapes[name]
+            z = int(rng.integers(0, depth))
+            y = int(rng.integers(self.half, height - self.half))
+            x = int(rng.integers(self.half, width - self.half))
+            coords.append((name, z, y, x))
+        return coords
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> tuple:
+        name, z, y, x = self.coords[idx]
+        slice_2d = _read_slice(self.source_paths[name], z, dtype=np.float32)
+        patch = slice_2d[y - self.half: y + self.half + 1, x - self.half: x + self.half + 1]
+        patch_tensor = torch.from_numpy((patch - self.normalize_mean) / self.normalize_std).unsqueeze(0)
+        segment_tensor = torch.full((1, self.patch_size, self.patch_size), UNRECOGNIZED_LABEL, dtype=torch.long)
+        return (
+            patch_tensor,
+            torch.tensor(UNRECOGNIZED_LABEL, dtype=torch.long),
+            segment_tensor,
+            torch.tensor([z, y, x], dtype=torch.long),
+            torch.tensor(False, dtype=torch.bool),
+        )
+
+
+class PretrainMultiResDataset(PretrainDataset):
+    """Multi-resolution version of PretrainDataset for MuViT pretraining.
+
+    Returns the same dict format as WildWestMultiResDataset.
+    """
+
+    def __init__(
+        self,
+        dataset_root: Path,
+        names: list[str],
+        patch_size: int,
+        normalize_mean: float,
+        normalize_std: float,
+        num_samples: int,
+        resolution_scales: Sequence[float],
+        seed: int = 42,
+    ) -> None:
+        self.resolution_scales = list(resolution_scales)
+        self.max_half_extent = math.ceil((patch_size / 2.0) * max(resolution_scales))
+        super().__init__(dataset_root, names, patch_size, normalize_mean, normalize_std, num_samples, seed)
+
+    def _sample_coords(self, names: list[str], seed: int) -> list[tuple[str, int, int, int]]:
+        rng = np.random.default_rng(seed)
+        coords = []
+        margin = self.max_half_extent
+        for _ in range(self.num_samples):
+            name = names[rng.integers(len(names))]
+            depth, height, width = self.volume_shapes[name]
+            z = int(rng.integers(0, depth))
+            y = int(rng.integers(margin, height - margin))
+            x = int(rng.integers(margin, width - margin))
+            coords.append((name, z, y, x))
+        return coords
+
+    def __getitem__(self, idx: int) -> dict:
+        name, z, y, x = self.coords[idx]
+        slice_2d = _read_slice(self.source_paths[name], z, dtype=np.float32)
+        bbox = build_level_bboxes(y, x, self.patch_size, self.resolution_scales)
+        imgs = torch.stack([
+            sample_bbox_from_slice(slice_2d, bbox[level], out_size=self.patch_size)
+            for level in range(len(self.resolution_scales))
+        ])
+        imgs = (imgs - self.normalize_mean) / self.normalize_std
+        segment_tensor = torch.full((1, self.patch_size, self.patch_size), UNRECOGNIZED_LABEL, dtype=torch.long)
+        return {
+            "img": imgs,
+            "bbox": bbox,
+            "center_label": torch.tensor(UNRECOGNIZED_LABEL, dtype=torch.long),
+            "segment": segment_tensor,
+            "coords": torch.tensor([z, y, x], dtype=torch.long),
+            "is_labeled": torch.tensor(False, dtype=torch.bool),
+        }
+
+
+def build_pretrain_loader(
+    dataset_root: Path,
+    names: list[str],
+    patch_size: int,
+    normalize_mean: float,
+    normalize_std: float,
+    num_samples: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    resolution_scales: Sequence[float] | None = None,
+) -> DataLoader:
+    if resolution_scales is not None:
+        dataset: Dataset = PretrainMultiResDataset(
+            dataset_root=dataset_root,
+            names=names,
+            patch_size=patch_size,
+            normalize_mean=normalize_mean,
+            normalize_std=normalize_std,
+            num_samples=num_samples,
+            resolution_scales=resolution_scales,
+            seed=seed,
+        )
+    else:
+        dataset = PretrainDataset(
+            dataset_root=dataset_root,
+            names=names,
+            patch_size=patch_size,
+            normalize_mean=normalize_mean,
+            normalize_std=normalize_std,
+            num_samples=num_samples,
+            seed=seed,
+        )
+    print(f"pretrain dataset: {len(dataset)} random patches from volumes {names}", flush=True)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
+        worker_init_fn=seed_worker,
+        generator=make_torch_generator(seed),
+    )
+
+
 def run_balanced_batch_sampler_self_tests() -> None:
     labeled_indices = list(range(100))
     unlabeled_indices = list(range(100, 125))

@@ -32,6 +32,7 @@ from wild_west_dataloader import (
     WildWestCoordDataset,
     WildWestMultiResDataset,
     build_level_bboxes,
+    build_pretrain_loader,
     build_train_val_loaders,
     build_train_val_multires_loaders,
     run_balanced_batch_sampler_self_tests,
@@ -230,6 +231,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=1)
     parser.add_argument("--mask-ratio", type=float, default=0.00)
     parser.add_argument(
+        "--mask-end-ratio",
+        type=float,
+        default=None,
+        help="If set, enables mask ratio decay schedule. Floor value the ratio decays toward.",
+    )
+    parser.add_argument(
+        "--mask-decay-epochs",
+        type=int,
+        default=5,
+        help="Decrease mask ratio every N epochs when decay schedule is active.",
+    )
+    parser.add_argument(
+        "--mask-decay-step",
+        type=float,
+        default=0.15,
+        help="Amount to subtract from mask ratio per decay step.",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=None,
+        help="Dirichlet concentration parameter for per-level mask ratio sampling (MuViT only). "
+             "None = uniform masking across levels. Lower values = more variance (paper uses 0.5).",
+    )
+    parser.add_argument(
         "--masking-mode",
         choices=("token", "drop"),
         default="token",
@@ -243,10 +269,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cls-loss-weight", type=float, default=1.0)
     parser.add_argument(
+        "--pretrain-epochs",
+        type=int,
+        default=0,
+        help="Epochs of reconstruction-only pretraining on random patches before full training. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--pretrain-samples-per-epoch",
+        type=int,
+        default=None,
+        help="Number of random patches per pretrain epoch. Defaults to len(train_dataset).",
+    )
+    parser.add_argument(
         "--loss-mode",
         choices=base_train.LOSS_MODES,
         default="ce_reconstruct_all",
         help="Reconstruction term combined with visible-token cross-entropy.",
+    )
+    parser.add_argument(
+        "--normalize-patches",
+        action="store_true",
+        default=False,
+        help="Normalize each patch token to zero mean and unit variance before MSE loss (MAE-style).",
+    )
+    parser.add_argument(
+        "--fft-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for FFT frequency-domain L1 loss added to MSE. 0.0 = disabled. MuViT uses 0.01.",
     )
     parser.add_argument("--mlp-ratio", type=float, default=2.0)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -316,9 +366,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, tuple[float, float]]:
+def build_loaders(
+    args: argparse.Namespace,
+) -> tuple[DataLoader, DataLoader, tuple[float, float], DataLoader | None]:
     if args.model_style == "muvit":
-        return build_train_val_multires_loaders(
+        train_loader, val_loader, data_stats = build_train_val_multires_loaders(
             dataset_root=args.dataset_root,
             dataset_size=args.dataset_size,
             batch_size=args.batch_size,
@@ -330,17 +382,38 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, tup
             unlabeled_mix_ratio=args.unlabeled_mix_ratio,
             seed=args.seed,
         )
-    return build_train_val_loaders(
-        dataset_root=args.dataset_root,
-        dataset_size=args.dataset_size,
-        batch_size=args.batch_size,
-        patch_size=args.patch_size,
-        num_workers=args.num_workers,
-        train_coords_csv=args.train_coords_csv,
-        val_coords_csv=args.val_coords_csv,
-        unlabeled_mix_ratio=args.unlabeled_mix_ratio,
-        seed=args.seed,
-    )
+    else:
+        train_loader, val_loader, data_stats = build_train_val_loaders(
+            dataset_root=args.dataset_root,
+            dataset_size=args.dataset_size,
+            batch_size=args.batch_size,
+            patch_size=args.patch_size,
+            num_workers=args.num_workers,
+            train_coords_csv=args.train_coords_csv,
+            val_coords_csv=args.val_coords_csv,
+            unlabeled_mix_ratio=args.unlabeled_mix_ratio,
+            seed=args.seed,
+        )
+
+    pretrain_loader = None
+    if args.pretrain_epochs > 0:
+        mean, std = data_stats
+        names = sorted({s.name for s in train_loader.dataset.labeled_samples})
+        num_samples = args.pretrain_samples_per_epoch or len(train_loader.dataset)
+        pretrain_loader = build_pretrain_loader(
+            dataset_root=args.dataset_root,
+            names=names,
+            patch_size=args.patch_size,
+            normalize_mean=mean,
+            normalize_std=std,
+            num_samples=num_samples,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed,
+            resolution_scales=args.resolution_scales if args.model_style == "muvit" else None,
+        )
+
+    return train_loader, val_loader, data_stats, pretrain_loader
 
 
 def infer_wild_west_in_channels(loader: DataLoader) -> int:
@@ -467,6 +540,8 @@ def run_epoch(
     mask_selection_mode: str = "any",
     cls_loss_weight: float = 1.0,
     loss_mode: str = "ce_reconstruct_all",
+    normalize_patches: bool = False,
+    fft_loss_weight: float = 0.0,
     optimizer: AdamW | None = None,
     stage_name: str = "eval",
     epoch: int | None = None,
@@ -524,6 +599,8 @@ def run_epoch(
                     visible_mask=aux.visible_mask[:, : model.num_patches],
                     vit_patch_size=vit_patch_size,
                     loss_mode=loss_mode,
+                    normalize_patches=normalize_patches,
+                    fft_loss_weight=fft_loss_weight,
                 )
                 ce_loss, cls_acc, supervised_samples = compute_center_patch_classification_metrics(
                     aux.token_logits,
@@ -576,6 +653,8 @@ def run_epoch(
                 visible_mask=aux.visible_mask,
                 vit_patch_size=vit_patch_size,
                 loss_mode=loss_mode,
+                normalize_patches=normalize_patches,
+                fft_loss_weight=fft_loss_weight,
             )
             ce_loss, cls_acc, supervised_samples = compute_center_patch_classification_metrics(
                 aux.token_logits,
@@ -1042,6 +1121,20 @@ def save_wild_west_embeddings_preview(
     torch.save(embeddings, output_dir / f"{split_name}_embeddings_preview.pt")
 
 
+def compute_scheduled_mask_ratio(
+    epoch: int,
+    mask_start: float,
+    mask_end: float,
+    decay_epochs: int,
+    decay_step: float,
+) -> float:
+    steps_taken = (epoch - 1) // decay_epochs
+    ratio = mask_start + steps_taken * decay_step
+    if mask_end > mask_start:
+        return min(ratio, mask_end)
+    return max(ratio, mask_end)
+
+
 def main() -> None:
     args = parse_args()
     if args.self_test:
@@ -1069,7 +1162,7 @@ def main() -> None:
         flush=True,
     )
 
-    train_loader, val_loader, data_stats = build_loaders(args)
+    train_loader, val_loader, data_stats, pretrain_loader = build_loaders(args)
 
     train_dataset_composition = extract_dataset_composition(train_loader)
     val_dataset_composition = extract_dataset_composition(val_loader)
@@ -1119,6 +1212,7 @@ def main() -> None:
             classifier_context_kernel_size=args.classifier_context_kernel_size,
             classifier_hidden_dim=args.classifier_hidden_dim,
             masking_mode=args.masking_mode,
+            dirichlet_alpha=args.dirichlet_alpha,
         ).to(device)
     else:
         model = WildWestViTAutoencoder(
@@ -1149,15 +1243,31 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         epoch_timestamp = datetime.now(timezone.utc).isoformat()
+        is_pretraining = epoch <= args.pretrain_epochs
+        phase = "pretrain" if is_pretraining else "finetune"
+        current_loader = pretrain_loader if is_pretraining else train_loader
+        current_cls_loss_weight = 0.0 if is_pretraining else args.cls_loss_weight
+        if args.mask_end_ratio is not None:
+            current_mask_ratio = compute_scheduled_mask_ratio(
+                epoch,
+                mask_start=args.mask_ratio,
+                mask_end=args.mask_end_ratio,
+                decay_epochs=args.mask_decay_epochs,
+                decay_step=args.mask_decay_step,
+            )
+        else:
+            current_mask_ratio = args.mask_ratio
         train_metrics = run_epoch(
             model,
-            train_loader,
+            current_loader,
             device,
             vit_patch_size=args.vit_patch_size,
-            mask_ratio=args.mask_ratio,
+            mask_ratio=current_mask_ratio,
             mask_selection_mode=args.mask_selection_mode,
-            cls_loss_weight=args.cls_loss_weight,
+            cls_loss_weight=current_cls_loss_weight,
             loss_mode=args.loss_mode,
+            normalize_patches=args.normalize_patches,
+            fft_loss_weight=args.fft_loss_weight,
             optimizer=optimizer,
             stage_name="train",
             epoch=epoch,
@@ -1168,17 +1278,21 @@ def main() -> None:
             val_loader,
             device,
             vit_patch_size=args.vit_patch_size,
-            mask_ratio=args.mask_ratio,
+            mask_ratio=current_mask_ratio,
             mask_selection_mode=args.mask_selection_mode,
-            cls_loss_weight=args.cls_loss_weight,
+            cls_loss_weight=current_cls_loss_weight,
             loss_mode=args.loss_mode,
+            normalize_patches=args.normalize_patches,
+            fft_loss_weight=args.fft_loss_weight,
             stage_name="val",
             epoch=epoch,
         )
         history.append(
             {
                 "epoch": epoch,
+                "phase": phase,
                 "timestamp_utc": epoch_timestamp,
+                "mask_ratio": current_mask_ratio,
                 "train_loss": train_metrics["total_loss"],
                 "val_loss": val_metrics["total_loss"],
                 "train_mse": train_metrics["mse_loss"],
@@ -1189,6 +1303,8 @@ def main() -> None:
                 "val_cls_acc": val_metrics["cls_acc"],
             }
         )
+        if is_pretraining and epoch == args.pretrain_epochs:
+            torch.save(model.state_dict(), run_output_dir / "pretrain.pt")
         is_best = val_metrics["total_loss"] < best_val
         if is_best:
             best_val = val_metrics["total_loss"]
@@ -1208,7 +1324,8 @@ def main() -> None:
             )
 
         print(
-            f"[{epoch_timestamp}] epoch={epoch:03d} "
+            f"[{epoch_timestamp}] epoch={epoch:03d} phase={phase} cls_w={current_cls_loss_weight:.4f} "
+            f"mask_ratio={current_mask_ratio:.4f} "
             f"train_total={train_metrics['total_loss']:.6f} train_mse={train_metrics['mse_loss']:.6f} "
             f"train_ce={train_metrics['ce_loss']:.6f} train_acc={train_metrics['cls_acc']:.4f} "
             f"val_total={val_metrics['total_loss']:.6f} val_mse={val_metrics['mse_loss']:.6f} "
@@ -1219,6 +1336,9 @@ def main() -> None:
             wandb_run.log(
                 {
                     "epoch": epoch,
+                    "phase": phase,
+                    "mask_ratio": current_mask_ratio,
+                    "cls_loss_weight": current_cls_loss_weight,
                     "train/total": train_metrics["total_loss"],
                     "train/mse": train_metrics["mse_loss"],
                     "train/ce": train_metrics["ce_loss"],

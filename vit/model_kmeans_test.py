@@ -31,9 +31,11 @@ from config.app_config import (
     model_kmeans_output_dir,
 )
 from label_utils import remap_label_array
+from models_muvit_v2 import WildWestMuViTV2
 from models_vit import ViTAutoencoder
 from plotting.common import append_timestamp
 from plotting.testing import build_kmeans_figure
+from reproducibility import configure_reproducibility
 from test_image_extractor import (
     DEFAULT_CROP_HEIGHT,
     DEFAULT_CROP_WIDTH,
@@ -140,11 +142,41 @@ def infer_depth(state_dict: dict[str, torch.Tensor]) -> int:
     return len({int(key.split('.')[2]) for key in state_dict if key.startswith('encoder.layers.')})
 
 
-def load_model(checkpoint: dict[str, object], device: torch.device) -> ViTAutoencoder:
+def infer_muvit_depth(state_dict: dict[str, torch.Tensor]) -> int:
+    return len({int(key.split('.')[1]) for key in state_dict if key.startswith('blocks.')})
+
+
+def load_model(checkpoint: dict[str, object], device: torch.device):
     model_config = checkpoint['model_config']
     state_dict = checkpoint['model_state']
-    depth = infer_depth(state_dict)
     training_config = checkpoint.get('training_config', {})
+    model_style = str(model_config.get('model_style', training_config.get('model_style', 'vit')))
+    if model_style == 'muvit':
+        depth = infer_muvit_depth(state_dict)
+        model = WildWestMuViTV2(
+            image_size=model_config['image_size'],
+            patch_size=model_config['patch_size'],
+            in_channels=model_config['in_channels'],
+            embed_dim=model_config['embed_dim'],
+            depth=depth,
+            num_heads=int(training_config.get('num_heads', 1)),
+            mlp_ratio=float(training_config.get('mlp_ratio', 4.0)),
+            dropout=float(training_config.get('dropout', 0.0)),
+            num_classes=int(model_config.get('num_classes', 4)),
+            num_levels=int(model_config.get('num_levels', len(model_config.get('resolution_scales', (1.0,))))),
+            rope_base=float(model_config.get('rope_base', training_config.get('rope_base', 10000.0))),
+            segmentation_head=str(model_config.get('segmentation_head', 'linear')),
+            classifier_context_kernel_size=int(model_config.get('classifier_context_kernel_size', 1)),
+            classifier_hidden_dim=model_config.get('classifier_hidden_dim'),
+            masking_mode=str(model_config.get('masking_mode', training_config.get('masking_mode', 'token'))),
+        )
+        model.resolution_scales = tuple(float(scale) for scale in model_config.get('resolution_scales', training_config.get('resolution_scales', (1.0,))))
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        model.to(device)
+        return model
+
+    depth = infer_depth(state_dict)
     mlp_ratio = training_config.get('mlp_ratio')
     if mlp_ratio is None:
         mlp_ratio = state_dict['encoder.layers.0.linear1.weight'].shape[0] / model_config['embed_dim']
@@ -161,6 +193,7 @@ def load_model(checkpoint: dict[str, object], device: torch.device) -> ViTAutoen
         num_heads=num_heads,
         mlp_ratio=mlp_ratio,
         dropout=dropout,
+        masking_mode=str(model_config.get('masking_mode', training_config.get('masking_mode', 'token'))),
         num_classes=int(model_config.get('num_classes', 4)),
         segmentation_head=str(model_config.get('segmentation_head', 'linear')),
         classifier_context_kernel_size=int(model_config.get('classifier_context_kernel_size', 1)),
@@ -392,8 +425,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, object]:
     if args.max_pixels is not None and args.max_pixels < 1:
         raise ValueError('--max-pixels must be >= 1 when provided')
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    configure_reproducibility(args.seed)
 
     device = torch.device(args.device)
     datamodule = build_datamodule(args)
