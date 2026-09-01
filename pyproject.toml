@@ -1,0 +1,16 @@
+[project]
+name = "eps-segformer"
+version = "0.1.0"
+description = "ViT autoencoder experiments and embedding analysis on top of eps-seg."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "eps-seg @ git+https://github.com/juglab/eps-Seg.git@c5e97646ab3a4f19ccdfeb489b582ad2b81a6ced",
+    "matplotlib>=3.10",
+    "numpy>=2.0",
+    "scikit-learn>=1.7",
+    "tifffile>=2025.10.4",
+    "torch==2.8",
+    "tqdm>=4.67",
+    "wandb>=0.25",
+]

@@ -136,6 +136,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.wandb
+config/.env.wandb
 .envrc
 .venv
 env/
@@ -205,3 +207,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+runs/
+config/
+*.sbatch
+
+# Editor / tool local state
+.claude/
+.codex
+.vscode/
